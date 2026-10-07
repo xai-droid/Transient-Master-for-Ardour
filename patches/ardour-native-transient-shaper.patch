@@ -1,0 +1,171 @@
+diff --git a/libs/ardour/ardour/dsp_filter.h b/libs/ardour/ardour/dsp_filter.h
+index 11ff3e20f0..64c213fb12 100644
+--- a/libs/ardour/ardour/dsp_filter.h
++++ b/libs/ardour/ardour/dsp_filter.h
+@@ -218,6 +218,22 @@ namespace ARDOUR { namespace DSP {
+ 			float _a;
+ 	};
+ 
++	class LIBARDOUR_API TransientShaper {
++	public:
++		TransientShaper (double samplerate);
++		void run (float* data, uint32_t n_samples, float attack_db, float sustain_db, float sensitivity, float release_ms, float mix, float output_db);
++
++	private:
++		double _rate;
++		float _fast_envelope;
++		float _slow_envelope;
++		float _attack_gain;
++		float _sustain_gain;
++		float _sensitivity;
++		float _mix;
++		float _output_gain;
++	};
++
+ 	/** Biquad Filter */
+ 	class LIBARDOUR_API Biquad {
+ 		public:
+diff --git a/libs/ardour/dsp_filter.cc b/libs/ardour/dsp_filter.cc
+index 8c93372689..167f61d3ef 100644
+--- a/libs/ardour/dsp_filter.cc
++++ b/libs/ardour/dsp_filter.cc
+@@ -154,6 +154,69 @@ LowPass::ctrl (float* data, const float val, const uint32_t n_samples)
+ 	_z = z;
+ }
+ 
++TransientShaper::TransientShaper (double samplerate)
++	: _rate (samplerate)
++	, _fast_envelope (0.f)
++	, _slow_envelope (0.f)
++	, _attack_gain (1.f)
++	, _sustain_gain (1.f)
++	, _sensitivity (1.f)
++	, _mix (1.f)
++	, _output_gain (1.f)
++{
++}
++
++void
++TransientShaper::run (float* data, uint32_t n_samples, float attack_db, float sustain_db, float sensitivity, float release_ms, float mix, float output_db)
++{
++	if (!data || n_samples == 0 || _rate <= 0) {
++		return;
++	}
++
++	const float target_attack_gain = dB_to_coefficient (attack_db);
++	const float target_sustain_gain = dB_to_coefficient (sustain_db);
++	const float target_output_gain = dB_to_coefficient (output_db);
++	const float target_mix = std::max (0.f, std::min (1.f, mix / 100.f));
++	const float target_sensitivity = std::max (0.1f, std::min (4.f, sensitivity));
++	const float release = std::max (20.f, std::min (500.f, release_ms)) * 0.001f;
++	const float smoothing = 1.f - expf (-static_cast<float> (n_samples) / (0.01f * _rate));
++
++	_attack_gain += smoothing * (target_attack_gain - _attack_gain);
++	_sustain_gain += smoothing * (target_sustain_gain - _sustain_gain);
++	_sensitivity += smoothing * (target_sensitivity - _sensitivity);
++	_mix += smoothing * (target_mix - _mix);
++	_output_gain += smoothing * (target_output_gain - _output_gain);
++
++	const float fast_attack = expf (-1.f / (0.0005f * _rate));
++	const float slow_attack = expf (-1.f / (0.025f * _rate));
++	const float fast_release = expf (-1.f / (0.01f * _rate));
++	const float slow_release = expf (-1.f / (release * _rate));
++
++	for (uint32_t i = 0; i < n_samples; ++i) {
++		const float input = data[i];
++		const float level = fabsf (input);
++
++		const float fast_coefficient = level > _fast_envelope ? fast_attack : fast_release;
++		_fast_envelope = level + fast_coefficient * (_fast_envelope - level);
++
++		const float slow_coefficient = level > _slow_envelope ? slow_attack : slow_release;
++		_slow_envelope = level + slow_coefficient * (_slow_envelope - level);
++
++		const float attack_weight = std::max (0.f, std::min (1.f,
++			(_fast_envelope - _slow_envelope) / std::max (_fast_envelope, 0.000001f) * _sensitivity));
++		const float shaped_gain = _sustain_gain + attack_weight * (_attack_gain - _sustain_gain);
++		const float wet = input * shaped_gain * _output_gain;
++		data[i] = input + _mix * (wet - input);
++	}
++
++	if (!isfinite_local (_fast_envelope) || !std::isnormal (_fast_envelope)) {
++		_fast_envelope = 0.f;
++	}
++	if (!isfinite_local (_slow_envelope) || !std::isnormal (_slow_envelope)) {
++		_slow_envelope = 0.f;
++	}
++}
++
+ /* ****************************************************************************/
+ 
+ Biquad::Biquad (double samplerate)
+diff --git a/libs/ardour/luabindings.cc b/libs/ardour/luabindings.cc
+index cb5e3fdd7e..224233a82d 100644
+--- a/libs/ardour/luabindings.cc
++++ b/libs/ardour/luabindings.cc
+@@ -3439,6 +3439,10 @@ LuaBindings::common (lua_State* L)
+ 		.addFunction ("set_cutoff", &DSP::LowPass::set_cutoff)
+ 		.addFunction ("reset", &DSP::LowPass::reset)
+ 		.endClass ()
++		.beginClass <DSP::TransientShaper> ("TransientShaper")
++		.addConstructor <void (*) (double)> ()
++		.addFunction ("run", &DSP::TransientShaper::run)
++		.endClass ()
+ 		.beginClass <DSP::Biquad> ("Biquad")
+ 		.addConstructor <void (*) (double)> ()
+ 		.addFunction ("run", &DSP::Biquad::run)
+diff --git a/libs/ardour/test/lua_script_test.cc b/libs/ardour/test/lua_script_test.cc
+index 4eefae3c16..372b4ca6da 100644
+--- a/libs/ardour/test/lua_script_test.cc
++++ b/libs/ardour/test/lua_script_test.cc
+@@ -1,8 +1,10 @@
+ #include <list>
++#include <vector>
+ #include <glibmm.h>
+ 
+ #include "ardour/audio_track.h"
+ #include "ardour/audioengine.h"
++#include "ardour/dsp_filter.h"
+ #include "ardour/luascripting.h"
+ #include "ardour/lua_script_params.h"
+ #include "ardour/plugin_manager.h"
+@@ -103,3 +105,23 @@ LuaScriptTest::dsp_script_test ()
+ 		CPPUNIT_ASSERT_MESSAGE ((*i)->name, rv == 0);
+ 	}
+ }
++
++void
++LuaScriptTest::transient_shaper_signal_test ()
++{
++	std::vector<float> unity_signal (64);
++	for (size_t i = 0; i < unity_signal.size (); ++i) {
++		unity_signal[i] = (i & 1) ? -0.25f : 0.25f;
++	}
++
++	DSP::TransientShaper unity_shaper (48000.0);
++	unity_shaper.run (unity_signal.data (), unity_signal.size (), 0.f, 0.f, 1.f, 120.f, 100.f, 0.f);
++	for (size_t i = 0; i < unity_signal.size (); ++i) {
++		CPPUNIT_ASSERT_DOUBLES_EQUAL ((i & 1) ? -0.25 : 0.25, unity_signal[i], 1e-6);
++	}
++
++	std::vector<float> gain_signal (4800, 0.25f);
++	DSP::TransientShaper gain_shaper (48000.0);
++	gain_shaper.run (gain_signal.data (), gain_signal.size (), 0.f, 0.f, 1.f, 120.f, 100.f, 6.f);
++	CPPUNIT_ASSERT_DOUBLES_EQUAL (0.25 * dB_to_coefficient (6.f), gain_signal.back (), 1e-3);
++}
+diff --git a/libs/ardour/test/lua_script_test.h b/libs/ardour/test/lua_script_test.h
+index 967755d9d1..8af2e20065 100644
+--- a/libs/ardour/test/lua_script_test.h
++++ b/libs/ardour/test/lua_script_test.h
+@@ -7,9 +7,11 @@ class LuaScriptTest : public TestNeedingSession
+ 	CPPUNIT_TEST_SUITE (LuaScriptTest);
+ 	CPPUNIT_TEST (session_script_test);
+ 	CPPUNIT_TEST (dsp_script_test);
++	CPPUNIT_TEST (transient_shaper_signal_test);
+ 	CPPUNIT_TEST_SUITE_END ();
+ 
+ public:
+ 	void session_script_test ();
+ 	void dsp_script_test ();
++	void transient_shaper_signal_test ();
+ };
